@@ -4,122 +4,124 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 def clean_ics_content(raw_ics_text: str) -> str:
-    # 拆分所有 VEVENT
-    events = re.split(r'(BEGIN:VEVENT[\s\S]*?END:VEVENT)', raw_ics_text)
-    
-    cleaned_parts = []
-    
-    for part in events:
-        if not part.startswith("BEGIN:VEVENT"):
-            cleaned_parts.append(part)
+    # 1. 统一换行符并还原 iCalendar 折行
+    normalized = raw_ics_text.replace('\r\n', '\n').replace('\r', '\n')
+    unfolded = re.sub(r'\n[ \t]', '', normalized)
+
+    # 2. 匹配所有 VEVENT 区块
+    raw_events = re.findall(r'BEGIN:VEVENT([\s\S]*?)END:VEVENT', unfolded)
+
+    output_lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Chalmers TimeEdit Cleaner//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "X-WR-CALNAME:Chalmers 课表",
+        "X-WR-TIMEZONE:Europe/Stockholm"
+    ]
+
+    for ev_body in raw_events:
+        # 提取基础字段
+        uid_m = re.search(r'UID:([^\n]+)', ev_body)
+        dtstart_m = re.search(r'DTSTART:([^\n]+)', ev_body)
+        dtend_m = re.search(r'DTEND:([^\n]+)', ev_body)
+        dtstamp_m = re.search(r'DTSTAMP:([^\n]+)', ev_body)
+        url_m = re.search(r'URL:([^\n]+)', ev_body)
+        loc_m = re.search(r'LOCATION:([\s\S]*?)(?=\n[A-Z\-]+:|$)', ev_body)
+
+        if not dtstart_m or not dtend_m:
             continue
-            
-        # 还原折行 (iCalendar 标准折行：换行 + 空格/制表符)
-        unfolded_event = re.sub(r'\r?\n[ \t]', '', part)
-        
-        # 提取字段
-        dtstart_m = re.search(r'DTSTART:[^\r\n]+', unfolded_event)
-        dtend_m = re.search(r'DTEND:[^\r\n]+', unfolded_event)
-        uid_m = re.search(r'UID:[^\r\n]+', unfolded_event)
-        dtstamp_m = re.search(r'DTSTAMP:[^\r\n]+', unfolded_event)
-        url_m = re.search(r'URL:([^\r\n]+)', unfolded_event)
-        loc_m = re.search(r'LOCATION:([\s\S]*?)(?=\r?\n[A-Z\-]+:|\r?\nEND:VEVENT)', unfolded_event)
-        
-        dtstart = dtstart_m.group(0) if dtstart_m else ""
-        dtend = dtend_m.group(0) if dtend_m else ""
-        uid = uid_m.group(0) if uid_m else ""
-        dtstamp = dtstamp_m.group(0) if dtstamp_m else ""
+
+        uid = uid_m.group(1).strip() if uid_m else ""
+        dtstart = dtstart_m.group(1).strip()
+        dtend = dtend_m.group(1).strip()
+        dtstamp = dtstamp_m.group(1).strip() if dtstamp_m else dtstart
         event_url = url_m.group(1).strip() if url_m else ""
         raw_location = loc_m.group(1).strip() if loc_m else ""
-        
-        # 解析 LOCATION 内部结构
-        # 把转义的 \n 拆成实际行
+
+        # 解析 LOCATION
         loc_lines = [l.strip() for l in raw_location.replace(r'\n', '\n').split('\n') if l.strip()]
-        
+
         course_code = ""
         activity = ""
         rooms = []
         building = ""
         campus = ""
-        
+
         for line in loc_lines:
             if "Course code:" in line and not course_code:
                 c_m = re.search(r'Course code:\s*([A-Za-z0-9_]+)', line)
                 if c_m:
-                    # 提取 DAT400 或 DAT385
                     course_code = c_m.group(1).split('_')[0]
-                    
-            elif "Activity:" in line:
+
+            elif "Activity:" in line and not activity:
                 a_m = re.search(r'Activity:\s*([^.\n]+)', line)
                 if a_m:
                     activity = a_m.group(1).strip()
-                    
+
             elif "Room name:" in line:
                 r_matches = re.findall(r'Room name:\s*([^.\n,]+)', line)
                 for r in r_matches:
-                    r_clean = r.strip()
-                    if r_clean and r_clean not in rooms:
-                        rooms.append(r_clean)
-                        
+                    rc = r.strip()
+                    if rc and rc not in rooms:
+                        rooms.append(rc)
+
             if "Building:" in line and not building:
                 b_m = re.search(r'Building:\s*([^.\n,]+)', line)
                 if b_m:
                     building = b_m.group(1).strip()
-                    
+
             if "Campus:" in line and not campus:
                 c_m = re.search(r'Campus:\s*([^\n\r,]+)', line)
                 if c_m:
                     campus = c_m.group(1).strip()
-                    
-            # 兼容 Game Development Project 这种没有 Activity 前缀的项
-            if "Game Development Project" in line:
+
+            if "Game Development Project" in line and not activity:
                 activity = "Game Dev Project"
 
-        # 生成精简标题: [DAT400] Lecture (HC3) 或 [DAT385] (Jupiter243)
-        title_items = []
+        # 拼接标题 (SUMMARY)
+        title_parts = []
         if course_code:
-            title_items.append(course_code)
+            title_parts.append(course_code)
         if activity:
-            title_items.append(activity)
-            
-        summary = " ".join(title_items) if title_items else "Course Event"
+            title_parts.append(activity)
+
+        summary = " ".join(title_parts) if title_parts else "Course Event"
         if rooms:
             summary += f" ({'/'.join(rooms)})"
-            
-        # 生成精简地点: Lindholmen, Jupiter, Jupiter243
-        loc_display_items = []
-        if campus: loc_display_items.append(campus)
-        if building: loc_display_items.append(building)
-        if rooms: loc_display_items.append("/".join(rooms))
-        clean_location_str = ", ".join(loc_display_items) if loc_display_items else raw_location
-        
-        # 描述与地图链接
-        desc_items = []
-        if campus: desc_items.append(f"校区: {campus}")
-        if building or rooms: desc_items.append(f"位置: {building} {'/'.join(rooms)}")
-        if event_url:
-            desc_items.append(f"导航: {event_url}")
-            
-        description_str = "\\n".join(desc_items)
-        
-        # 重新组装极简 VEVENT
-        new_event = [
-            "BEGIN:VEVENT",
-            uid,
-            dtstamp,
-            dtstart,
-            dtend,
-            f"SUMMARY:{summary}",
-            f"LOCATION:{clean_location_str}",
-            f"DESCRIPTION:{description_str}"
-        ]
-        if event_url:
-            new_event.append(f"URL:{event_url}")
-        new_event.append("END:VEVENT")
-        
-        cleaned_parts.append("\r\n".join([line for line in new_event if line]))
 
-    return "".join(cleaned_parts)
+        # 拼接地点 (LOCATION)
+        loc_parts = [p for p in [campus, building, "/".join(rooms)] if p]
+        clean_loc = ", ".join(loc_parts) if loc_parts else "Chalmers"
+
+        # 拼接描述 (DESCRIPTION)
+        desc_parts = []
+        if campus:
+            desc_parts.append(f"校区: {campus}")
+        if building or rooms:
+            desc_parts.append(f"教室: {building} {'/'.join(rooms)}")
+        if event_url:
+            desc_parts.append(f"导航: {event_url}")
+        description = "\\n".join(desc_parts)
+
+        # 组装事件
+        output_lines.append("BEGIN:VEVENT")
+        if uid:
+            output_lines.append(f"UID:{uid}")
+        output_lines.append(f"DTSTAMP:{dtstamp}")
+        output_lines.append(f"DTSTART:{dtstart}")
+        output_lines.append(f"DTEND:{dtend}")
+        output_lines.append(f"SUMMARY:{summary}")
+        output_lines.append(f"LOCATION:{clean_loc}")
+        if description:
+            output_lines.append(f"DESCRIPTION:{description}")
+        if event_url:
+            output_lines.append(f"URL:{event_url}")
+        output_lines.append("END:VEVENT")
+
+    output_lines.append("END:VCALENDAR")
+    return "\r\n".join(output_lines) + "\r\n"
 
 
 class handler(BaseHTTPRequestHandler):
@@ -130,27 +132,26 @@ class handler(BaseHTTPRequestHandler):
 
         if not target_url:
             self.send_response(200)
-            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
             self.end_headers()
             self.wfile.write("Service is running! Append ?url=<YOUR_TIMEEDIT_URL> to subscribe.".encode('utf-8'))
             return
 
         try:
-            # 伪造常见 User-Agent 避免被拦截
             headers = {'User-Agent': 'Mozilla/5.0'}
             resp = requests.get(target_url, headers=headers, timeout=15)
             resp.raise_for_status()
-            
+
             cleaned_ics = clean_ics_content(resp.text)
 
             self.send_response(200)
-            self.send_header('Content-type', 'text/calendar; charset=utf-8')
-            self.send_header('Content-Disposition', 'inline; filename=schedule.ics')
+            self.send_header('Content-Type', 'text/calendar; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
             self.end_headers()
             self.wfile.write(cleaned_ics.encode('utf-8'))
 
         except Exception as e:
             self.send_response(500)
-            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
             self.end_headers()
             self.wfile.write(f"Error processing calendar: {str(e)}".encode('utf-8'))
