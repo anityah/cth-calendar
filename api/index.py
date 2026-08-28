@@ -3,12 +3,18 @@ from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 import requests
 
+# 课程代码到全称的映射字典（可按需补充）
+COURSE_NAME_MAP = {
+    "DAT400": "High-Performance Parallel Computing",
+    "DAT385": "Game Development Project",
+    "DIT431": "High-Performance Parallel Computing",
+    "DIT248": "Game Development Project"
+}
+
 def clean_ics_content(raw_ics_text: str) -> str:
-    # 1. 统一换行符并还原 iCalendar 折行
     normalized = raw_ics_text.replace('\r\n', '\n').replace('\r', '\n')
     unfolded = re.sub(r'\n[ \t]', '', normalized)
 
-    # 2. 匹配所有 VEVENT 区块
     raw_events = re.findall(r'BEGIN:VEVENT([\s\S]*?)END:VEVENT', unfolded)
 
     output_lines = [
@@ -22,12 +28,10 @@ def clean_ics_content(raw_ics_text: str) -> str:
     ]
 
     for ev_body in raw_events:
-        # 提取基础字段
         uid_m = re.search(r'UID:([^\n]+)', ev_body)
         dtstart_m = re.search(r'DTSTART:([^\n]+)', ev_body)
         dtend_m = re.search(r'DTEND:([^\n]+)', ev_body)
         dtstamp_m = re.search(r'DTSTAMP:([^\n]+)', ev_body)
-        url_m = re.search(r'URL:([^\n]+)', ev_body)
         loc_m = re.search(r'LOCATION:([\s\S]*?)(?=\n[A-Z\-]+:|$)', ev_body)
 
         if not dtstart_m or not dtend_m:
@@ -37,23 +41,23 @@ def clean_ics_content(raw_ics_text: str) -> str:
         dtstart = dtstart_m.group(1).strip()
         dtend = dtend_m.group(1).strip()
         dtstamp = dtstamp_m.group(1).strip() if dtstamp_m else dtstart
-        event_url = url_m.group(1).strip() if url_m else ""
         raw_location = loc_m.group(1).strip() if loc_m else ""
 
-        # 解析 LOCATION
         loc_lines = [l.strip() for l in raw_location.replace(r'\n', '\n').split('\n') if l.strip()]
 
-        course_code = ""
+        course_name = ""
         activity = ""
         rooms = []
         building = ""
         campus = ""
 
         for line in loc_lines:
-            if "Course code:" in line and not course_code:
+            # 匹配课程代码并转换为课程全名
+            if "Course code:" in line and not course_name:
                 c_m = re.search(r'Course code:\s*([A-Za-z0-9_]+)', line)
                 if c_m:
-                    course_code = c_m.group(1).split('_')[0]
+                    code_prefix = c_m.group(1).split('_')[0]
+                    course_name = COURSE_NAME_MAP.get(code_prefix, "")
 
             elif "Activity:" in line and not activity:
                 a_m = re.search(r'Activity:\s*([^.\n]+)', line)
@@ -77,35 +81,34 @@ def clean_ics_content(raw_ics_text: str) -> str:
                 if c_m:
                     campus = c_m.group(1).strip()
 
-            if "Game Development Project" in line and not activity:
-                activity = "Game Dev Project"
+            # 文本中直接包含 Game Development Project 的兜底处理
+            if "Game Development Project" in line:
+                course_name = "Game Development Project"
 
-        # 拼接标题 (SUMMARY)
+        # 拼接标题（只含课程名称与活动，不含课程代码）
         title_parts = []
-        if course_code:
-            title_parts.append(course_code)
+        if course_name:
+            title_parts.append(course_name)
         if activity:
             title_parts.append(activity)
 
-        summary = " ".join(title_parts) if title_parts else "Course Event"
+        summary = " ".join(title_parts) if title_parts else "Course"
         if rooms:
             summary += f" ({'/'.join(rooms)})"
 
-        # 拼接地点 (LOCATION)
+        # 拼接地点（只保留校区、楼宇、教室）
         loc_parts = [p for p in [campus, building, "/".join(rooms)] if p]
         clean_loc = ", ".join(loc_parts) if loc_parts else "Chalmers"
 
-        # 拼接描述 (DESCRIPTION)
+        # 拼接描述（无链接）
         desc_parts = []
         if campus:
             desc_parts.append(f"校区: {campus}")
         if building or rooms:
             desc_parts.append(f"教室: {building} {'/'.join(rooms)}")
-        if event_url:
-            desc_parts.append(f"导航: {event_url}")
         description = "\\n".join(desc_parts)
 
-        # 组装事件
+        # 组装 VEVENT（不添加任何 URL 字段）
         output_lines.append("BEGIN:VEVENT")
         if uid:
             output_lines.append(f"UID:{uid}")
@@ -116,8 +119,6 @@ def clean_ics_content(raw_ics_text: str) -> str:
         output_lines.append(f"LOCATION:{clean_loc}")
         if description:
             output_lines.append(f"DESCRIPTION:{description}")
-        if event_url:
-            output_lines.append(f"URL:{event_url}")
         output_lines.append("END:VEVENT")
 
     output_lines.append("END:VCALENDAR")
