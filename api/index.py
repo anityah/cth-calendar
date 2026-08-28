@@ -3,7 +3,7 @@ from fastapi import FastAPI, Query, Response, HTTPException
 import requests
 from icalendar import Calendar, Event
 
-app = FastAPI()
+app = FastAPI(title="TimeEdit iCal Cleaner")
 
 def parse_timeedit_location(raw_text: str):
     if not raw_text:
@@ -46,14 +46,23 @@ def parse_timeedit_location(raw_text: str):
                 break
     return data
 
+@app.get("/")
 @app.get("/calendar.ics")
-def get_clean_calendar(url: str = Query(..., description="TimeEdit ICS URL")):
+@app.get("/api")
+@app.get("/api/index")
+def get_clean_calendar(url: str = Query(None, description="TimeEdit ICS URL")):
+    if not url:
+        return {
+            "status": "online",
+            "usage": "Append ?url=<YOUR_TIMEEDIT_ICS_URL> to subscribe"
+        }
+
     try:
         resp = requests.get(url, timeout=15)
         resp.raise_for_status()
         upstream_cal = Calendar.from_ical(resp.content)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to fetch/parse upstream iCal: {e}")
 
     clean_cal = Calendar()
     for prop in ['VERSION', 'PRODID', 'CALSCALE', 'X-WR-CALNAME']:
@@ -70,9 +79,9 @@ def get_clean_calendar(url: str = Query(..., description="TimeEdit ICS URL")):
             event.add('dtend', component.get('dtend').dt)
             if component.get('dtstamp'):
                 event.add('dtstamp', component.get('dtstamp').dt)
-
+                
             meta = parse_timeedit_location(str(component.get('location', '')))
-
+            
             title_parts = []
             if meta["course_code"]:
                 title_parts.append(meta["course_code"])
@@ -82,10 +91,10 @@ def get_clean_calendar(url: str = Query(..., description="TimeEdit ICS URL")):
             if meta["room"]:
                 title += f" ({meta['room']})"
             event.add('summary', title)
-
+            
             loc_parts = [p for p in [meta["campus"], meta["building"], meta["room"]] if p]
             event.add('location', ", ".join(loc_parts) if loc_parts else str(component.get('location', '')))
-
+            
             desc = []
             if meta["campus"]: desc.append(f"校区: {meta['campus']}")
             if meta["building"] or meta["room"]: desc.append(f"教室: {meta['building']} - {meta['room']}")
