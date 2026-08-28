@@ -1,113 +1,156 @@
 import re
-from fastapi import FastAPI, Query, Response, HTTPException
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import parse_qs, urlparse
 import requests
-from icalendar import Calendar, Event
 
-app = FastAPI(title="TimeEdit iCal Cleaner")
-
-def parse_timeedit_location(raw_text: str):
-    if not raw_text:
-        return {}
-    text = raw_text.replace(r'\n', '\n')
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
-    data = {
-        "course_code": "", "activity": "", "room": "", 
-        "building": "", "campus": "", "map_url": ""
-    }
-    for line in lines:
-        if "Course code:" in line and not data["course_code"]:
-            m = re.search(r"Course code:\s*([A-Za-z0-9_]+)", line)
-            if m:
-                data["course_code"] = m.group(1).split('_')[0]
-        elif "Activity:" in line:
-            m = re.search(r"Activity:\s*([^.]+)", line)
-            if m:
-                data["activity"] = m.group(1).strip()
-        elif "Room name:" in line:
-            room_m = re.search(r"Room name:\s*([^.]+)", line)
-            if room_m and not data["room"]:
-                data["room"] = room_m.group(1).strip()
-        if "Building:" in line:
-            b_m = re.search(r"Building:\s*([^.]+)", line)
-            if b_m and not data["building"]:
-                data["building"] = b_m.group(1).strip()
-        if "Campus:" in line:
-            c_m = re.search(r"Campus:\s*([^\n\r]+)", line)
-            if c_m and not data["campus"]:
-                data["campus"] = c_m.group(1).strip()
-        if "https://maps.chalmers.se" in line and not data["map_url"]:
-            url_m = re.search(r"(https://maps\.chalmers\.se/#?[a-zA-Z0-9\-_]*)", line)
-            if url_m:
-                data["map_url"] = url_m.group(1)
-    if not data["activity"]:
-        for line in lines:
+def clean_ics_content(raw_ics_text: str) -> str:
+    # 拆分所有 VEVENT
+    events = re.split(r'(BEGIN:VEVENT[\s\S]*?END:VEVENT)', raw_ics_text)
+    
+    cleaned_parts = []
+    
+    for part in events:
+        if not part.startswith("BEGIN:VEVENT"):
+            cleaned_parts.append(part)
+            continue
+            
+        # 还原折行 (iCalendar 标准折行：换行 + 空格/制表符)
+        unfolded_event = re.sub(r'\r?\n[ \t]', '', part)
+        
+        # 提取字段
+        dtstart_m = re.search(r'DTSTART:[^\r\n]+', unfolded_event)
+        dtend_m = re.search(r'DTEND:[^\r\n]+', unfolded_event)
+        uid_m = re.search(r'UID:[^\r\n]+', unfolded_event)
+        dtstamp_m = re.search(r'DTSTAMP:[^\r\n]+', unfolded_event)
+        url_m = re.search(r'URL:([^\r\n]+)', unfolded_event)
+        loc_m = re.search(r'LOCATION:([\s\S]*?)(?=\r?\n[A-Z\-]+:|\r?\nEND:VEVENT)', unfolded_event)
+        
+        dtstart = dtstart_m.group(0) if dtstart_m else ""
+        dtend = dtend_m.group(0) if dtend_m else ""
+        uid = uid_m.group(0) if uid_m else ""
+        dtstamp = dtstamp_m.group(0) if dtstamp_m else ""
+        event_url = url_m.group(1).strip() if url_m else ""
+        raw_location = loc_m.group(1).strip() if loc_m else ""
+        
+        # 解析 LOCATION 内部结构
+        # 把转义的 \n 拆成实际行
+        loc_lines = [l.strip() for l in raw_location.replace(r'\n', '\n').split('\n') if l.strip()]
+        
+        course_code = ""
+        activity = ""
+        rooms = []
+        building = ""
+        campus = ""
+        
+        for line in loc_lines:
+            if "Course code:" in line and not course_code:
+                c_m = re.search(r'Course code:\s*([A-Za-z0-9_]+)', line)
+                if c_m:
+                    # 提取 DAT400 或 DAT385
+                    course_code = c_m.group(1).split('_')[0]
+                    
+            elif "Activity:" in line:
+                a_m = re.search(r'Activity:\s*([^.\n]+)', line)
+                if a_m:
+                    activity = a_m.group(1).strip()
+                    
+            elif "Room name:" in line:
+                r_matches = re.findall(r'Room name:\s*([^.\n,]+)', line)
+                for r in r_matches:
+                    r_clean = r.strip()
+                    if r_clean and r_clean not in rooms:
+                        rooms.append(r_clean)
+                        
+            if "Building:" in line and not building:
+                b_m = re.search(r'Building:\s*([^.\n,]+)', line)
+                if b_m:
+                    building = b_m.group(1).strip()
+                    
+            if "Campus:" in line and not campus:
+                c_m = re.search(r'Campus:\s*([^\n\r,]+)', line)
+                if c_m:
+                    campus = c_m.group(1).strip()
+                    
+            # 兼容 Game Development Project 这种没有 Activity 前缀的项
             if "Game Development Project" in line:
-                data["activity"] = "Game Dev Project"
-                break
-    return data
+                activity = "Game Dev Project"
 
-@app.get("/")
-@app.get("/calendar.ics")
-@app.get("/api")
-@app.get("/api/index")
-def get_clean_calendar(url: str = Query(None, description="TimeEdit ICS URL")):
-    if not url:
-        return {
-            "status": "online",
-            "usage": "Append ?url=<YOUR_TIMEEDIT_ICS_URL> to subscribe"
-        }
-
-    try:
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        upstream_cal = Calendar.from_ical(resp.content)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to fetch/parse upstream iCal: {e}")
-
-    clean_cal = Calendar()
-    for prop in ['VERSION', 'PRODID', 'CALSCALE', 'X-WR-CALNAME']:
-        if prop in upstream_cal:
-            clean_cal.add(prop, upstream_cal[prop])
-        else:
-            clean_cal.add('X-WR-CALNAME', 'Chalmers 课表')
-
-    for component in upstream_cal.walk():
-        if component.name == "VEVENT":
-            event = Event()
-            event.add('uid', component.get('uid'))
-            event.add('dtstart', component.get('dtstart').dt)
-            event.add('dtend', component.get('dtend').dt)
-            if component.get('dtstamp'):
-                event.add('dtstamp', component.get('dtstamp').dt)
-                
-            meta = parse_timeedit_location(str(component.get('location', '')))
+        # 生成精简标题: [DAT400] Lecture (HC3) 或 [DAT385] (Jupiter243)
+        title_items = []
+        if course_code:
+            title_items.append(course_code)
+        if activity:
+            title_items.append(activity)
             
-            title_parts = []
-            if meta["course_code"]:
-                title_parts.append(meta["course_code"])
-            if meta["activity"]:
-                title_parts.append(meta["activity"])
-            title = " ".join(title_parts) if title_parts else "Course Event"
-            if meta["room"]:
-                title += f" ({meta['room']})"
-            event.add('summary', title)
+        summary = " ".join(title_items) if title_items else "Course Event"
+        if rooms:
+            summary += f" ({'/'.join(rooms)})"
             
-            loc_parts = [p for p in [meta["campus"], meta["building"], meta["room"]] if p]
-            event.add('location', ", ".join(loc_parts) if loc_parts else str(component.get('location', '')))
+        # 生成精简地点: Lindholmen, Jupiter, Jupiter243
+        loc_display_items = []
+        if campus: loc_display_items.append(campus)
+        if building: loc_display_items.append(building)
+        if rooms: loc_display_items.append("/".join(rooms))
+        clean_location_str = ", ".join(loc_display_items) if loc_display_items else raw_location
+        
+        # 描述与地图链接
+        desc_items = []
+        if campus: desc_items.append(f"校区: {campus}")
+        if building or rooms: desc_items.append(f"位置: {building} {'/'.join(rooms)}")
+        if event_url:
+            desc_items.append(f"导航: {event_url}")
             
-            desc = []
-            if meta["campus"]: desc.append(f"校区: {meta['campus']}")
-            if meta["building"] or meta["room"]: desc.append(f"教室: {meta['building']} - {meta['room']}")
-            map_url = str(component.get('url', '')) or meta["map_url"]
-            if map_url:
-                event.add('url', map_url)
-                desc.append(f"地图导航: {map_url}")
-            event.add('description', "\n".join(desc))
+        description_str = "\\n".join(desc_items)
+        
+        # 重新组装极简 VEVENT
+        new_event = [
+            "BEGIN:VEVENT",
+            uid,
+            dtstamp,
+            dtstart,
+            dtend,
+            f"SUMMARY:{summary}",
+            f"LOCATION:{clean_location_str}",
+            f"DESCRIPTION:{description_str}"
+        ]
+        if event_url:
+            new_event.append(f"URL:{event_url}")
+        new_event.append("END:VEVENT")
+        
+        cleaned_parts.append("\r\n".join([line for line in new_event if line]))
 
-            clean_cal.add_component(event)
+    return "".join(cleaned_parts)
 
-    return Response(
-        content=clean_cal.to_ical(),
-        media_type="text/calendar; charset=utf-8",
-        headers={"Content-Disposition": "inline; filename=schedule.ics"}
-    )
+
+class handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        target_url = params.get('url', [None])[0]
+
+        if not target_url:
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write("Service is running! Append ?url=<YOUR_TIMEEDIT_URL> to subscribe.".encode('utf-8'))
+            return
+
+        try:
+            # 伪造常见 User-Agent 避免被拦截
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            resp = requests.get(target_url, headers=headers, timeout=15)
+            resp.raise_for_status()
+            
+            cleaned_ics = clean_ics_content(resp.text)
+
+            self.send_response(200)
+            self.send_header('Content-type', 'text/calendar; charset=utf-8')
+            self.send_header('Content-Disposition', 'inline; filename=schedule.ics')
+            self.end_headers()
+            self.wfile.write(cleaned_ics.encode('utf-8'))
+
+        except Exception as e:
+            self.send_response(500)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(f"Error processing calendar: {str(e)}".encode('utf-8'))
